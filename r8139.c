@@ -7,6 +7,7 @@
  * hardware-specific register access belongs. Update PCI_VENDOR_ID /
  * PCI_DEVICE_ID and the TODO sections for your actual chip.
  */
+#define DEBUG
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -87,6 +88,8 @@ static int nic_open(struct net_device *ndev)
 	struct nic_priv *priv = netdev_priv(ndev);
 	int err;
 
+    netdev_dbg(ndev, "nic_open called\n");
+
 	err = request_irq(priv->irq, nic_irq_handler, IRQF_SHARED,
 			   DRV_NAME, ndev);
 	if (err) {
@@ -107,6 +110,8 @@ static int nic_open(struct net_device *ndev)
 static int nic_stop(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
+
+    netdev_dbg(ndev, "nic_stop called\n");
 
 	netif_stop_queue(ndev);
 	napi_disable(&priv->napi);
@@ -196,6 +201,8 @@ static int nic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	struct net_device *ndev;
 	struct nic_priv *priv;
 	int err;
+    phys_addr_t mmio_start;
+    phys_addr_t mmio_len;
 
 	err = pci_enable_device(pdev);
 	if (err)
@@ -226,11 +233,16 @@ static int nic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	priv->irq = pdev->irq;
 	spin_lock_init(&priv->lock);
 
-	priv->hw_addr = pci_iomap(pdev, 0, 0);
+    // read BAR 1 for MMIO registers
+    mmio_start = pci_resource_start(pdev, 1);
+    mmio_len   = pci_resource_len(pdev, 1);
+
+	priv->hw_addr = pci_iomap(pdev, 1, mmio_len);
 	if (!priv->hw_addr) {
 		err = -EIO;
 		goto err_free_netdev;
 	}
+    dev_info(&pdev->dev, "mapped BAR1 at %p (len=%pa)\n", priv->hw_addr, &mmio_len);
 
 	ndev->netdev_ops = &nic_netdev_ops;
 	ndev->ethtool_ops = &nic_ethtool_ops;
