@@ -2,6 +2,8 @@
 
 MODULE_NAME="r8139"
 
+sudo dmesg -C
+
 echo "=== 1. 嘗試停用介面並卸載模組 ==="
 sudo rmmod $MODULE_NAME 2>/dev/null
 

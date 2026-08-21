@@ -17,6 +17,8 @@
 #include <linux/ethtool.h>
 #include <linux/interrupt.h>
 #include <linux/version.h>
+#include <linux/types.h>
+#include "r8139.h"
 
 #define DRV_NAME	"waterdog_driver"
 #define DRV_VERSION	"0.1"
@@ -27,7 +29,7 @@
 
 #define TX_RING_SIZE	64
 #define RX_RING_SIZE	64
-#define NAPI_WEIGHT	64
+#define NAPI_WEIGHT	    64
 
 struct nic_priv {
 	struct pci_dev *pdev;
@@ -38,6 +40,12 @@ struct nic_priv {
 	int irq;
 
 	/* TODO: real TX/RX descriptor rings, DMA buffers, etc. go here */
+    /* TX Ring Control */
+    u8             *tx_buf[NUM_TX_DESC];     /* Virtual addresses for DMA buffers */
+    dma_addr_t     tx_buf_dma[NUM_TX_DESC]; /* Physical DMA addresses */
+    unsigned int   tx_head;                 /* Head index for next TX descriptor (0~3) */
+    unsigned int   tx_tail;                 /* Tail index for next TX cleanup (0~3) */
+    unsigned int   tx_free;                 /* Number of remaining available slots */
 };
 
 /* ---------------------------------------------------------------------
@@ -87,6 +95,7 @@ static int nic_open(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
 	int err;
+    u8 i;
 
     netdev_dbg(ndev, "nic_open called\n");
 
@@ -100,16 +109,41 @@ static int nic_open(struct net_device *ndev)
 	/* TODO: allocate TX/RX descriptor rings + DMA buffers, program
 	 * the device with their addresses, and enable RX/TX on the MAC.
 	 */
+    // tx
+    /* 1. Allocate coherent DMA memory for all 4 TX slots */
+    for (i = 0; i < NUM_TX_DESC; i++) {
+        priv->tx_buf[i] = dma_alloc_coherent(&priv->pdev->dev, TX_BUF_SIZE,
+                                             &priv->tx_buf_dma[i], GFP_KERNEL);
+        if (!priv->tx_buf[i])
+            goto err_free_dma;
+    }
+    priv->tx_head = 0;
+    priv->tx_tail = 0;
+    priv->tx_free = NUM_TX_DESC;
+    netdev_dbg(ndev, "tx alloc done.\n");
+    for (i = 0; i < NUM_TX_DESC; i++) {
+        netdev_dbg(ndev, "tx_buf[%d]: %p, tx_buf_dma[%d]: %p\n", i, priv->tx_buf[i], i, (void *)priv->tx_buf_dma[i]);
+    }
+
 
 	napi_enable(&priv->napi);
 	netif_start_queue(ndev);
 
 	return 0;
+
+err_free_dma:
+    /* Free previously allocated DMA memory on failure */
+    while (--i >= 0) {
+        dma_free_coherent(&priv->pdev->dev, TX_BUF_SIZE,
+                          priv->tx_buf[i], priv->tx_buf_dma[i]);
+    }
+    return -ENOMEM;
 }
 
 static int nic_stop(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
+    u8 i;
 
     netdev_dbg(ndev, "nic_stop called\n");
 
@@ -119,6 +153,17 @@ static int nic_stop(struct net_device *ndev)
 	/* TODO: disable RX/TX on the device, free descriptor rings and
 	 * DMA buffers.
 	 */
+    // tx
+    for (i = 0; i < NUM_TX_DESC; i++) {
+        dma_free_coherent(&priv->pdev->dev, TX_BUF_SIZE,
+                            &priv->tx_buf_dma[i], GFP_KERNEL);
+        priv->tx_buf[i] = 0;
+        priv->tx_buf_dma[i] = 0;
+    }
+    priv->tx_head = 0;
+    priv->tx_tail = 0;
+    priv->tx_free = NUM_TX_DESC;
+    netdev_dbg(ndev, "tx dma_free_coherent done.\n");
 
 	free_irq(priv->irq, ndev);
 
@@ -128,6 +173,9 @@ static int nic_stop(struct net_device *ndev)
 static netdev_tx_t nic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
+    unsigned int entry;
+    u32 tsd;
+    unsigned long flags;
 
 	/* TODO: map skb for DMA, place it on the TX ring, kick the
 	 * device's TX doorbell. Stop the queue with netif_stop_queue()
@@ -135,6 +183,40 @@ static netdev_tx_t nic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 	 * completion path (NAPI or a dedicated TX IRQ) via
 	 * netif_wake_queue().
 	 */
+    spin_lock_irqsave(&priv->lock, flags);
+
+    /* 1. Check if any TX slot is available */
+    if (priv->tx_free == 0) {
+        netif_stop_queue(ndev);
+        spin_unlock_irqrestore(&priv->lock, flags);
+        return NETDEV_TX_BUSY;
+    }
+
+    entry = priv->tx_head;
+
+    /* 2. Copy SKB packet data into the dedicated TX DMA buffer */
+    memset(priv->tx_buf[entry], 0, TX_BUF_SIZE);
+    skb_copy_from_linear_data(skb, priv->tx_buf[entry], skb->len);
+
+    /* 3. Write physical DMA address to TSAD register (0x20, 0x24, 0x28, 0x2C) */
+    writel(priv->tx_buf_dma[entry], priv->hw_addr + RTL_REG_TSAD0 + (entry * 4));
+
+    /* 4. Write frame length to TSD register (0x10, 0x14, 0x18, 0x1C). 
+     *    Writing to TSD triggers the NIC to start DMA transmission.
+     *    Note: Minimum Ethernet frame size is 60 bytes (excluding CRC).
+     */
+    tsd = max_t(unsigned int, skb->len, 60);
+    writel(tsd, priv->hw_addr + RTL_REG_TSD0 + (entry * 4));
+
+    /* 5. Update TX descriptors state and indices */
+    priv->tx_head = (priv->tx_head + 1) % NUM_TX_DESC;
+    priv->tx_free--;
+
+    /* Stop the OS queue if all slots are occupied */
+    if (priv->tx_free == 0)
+        netif_stop_queue(ndev);
+
+    spin_unlock_irqrestore(&priv->lock, flags);
 
 	dev_kfree_skb(skb);
 	priv->ndev->stats.tx_packets++;
