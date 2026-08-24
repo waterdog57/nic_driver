@@ -70,15 +70,61 @@ static int nic_poll(struct napi_struct *napi, int budget)
 	return work_done;
 }
 
+static void nic_tx_cleanup(struct net_device *ndev)
+{
+	struct nic_priv *priv = netdev_priv(ndev);
+	unsigned int entry;
+	u32 tsd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->lock, flags);
+
+	/* 1. Check if any TX slot is pending completion */
+	while (priv->tx_free < NUM_TX_DESC) {
+		entry = priv->tx_tail;
+
+		/* 2. Read TSD register to check if the NIC has completed transmission */
+		tsd = readl(priv->hw_addr + RTL_REG_TSD0 + (entry * 4));
+
+		if (!(tsd & TSD_OWN)) {
+			/* Slot is still owned by NIC, stop cleanup */
+			break;
+		}
+
+		/* 3. Transmission completed, free the slot */
+		priv->tx_tail = (priv->tx_tail + 1) % NUM_TX_DESC;
+		priv->tx_free++;
+
+		/* Wake up the OS queue if it was stopped */
+		if (priv->tx_free == 1)
+			netif_wake_queue(ndev);
+	}
+
+	spin_unlock_irqrestore(&priv->lock, flags);
+}
+
 static irqreturn_t nic_irq_handler(int irq, void *dev_id)
 {
 	struct net_device *ndev = dev_id;
 	struct nic_priv *priv = netdev_priv(ndev);
+	u16 status;
 
 	/* TODO: read/ack interrupt status register; if this IRQ isn't
 	 * ours, return IRQ_NONE.
 	 */
+	status = readw(priv->hw_addr + RTL_REG_ISR);
 
+	if(status == 0xFFFF || status == 0x0000) {
+		/* This is not our interrupt */
+		return IRQ_NONE;
+	}
+	writew(status, priv->hw_addr + RTL_REG_ISR); /* ack */
+
+	if (status & (INT_TOK | INT_TER )) {
+		nic_tx_cleanup(ndev);
+		netdev_info(ndev, "TX interrupt: status=0x%04x\n", status);
+	}
+		
 	if (napi_schedule_prep(&priv->napi)) {
 		/* TODO: mask RX interrupt on the device here */
 		__napi_schedule(&priv->napi);
@@ -86,6 +132,8 @@ static irqreturn_t nic_irq_handler(int irq, void *dev_id)
 
 	return IRQ_HANDLED;
 }
+
+
 
 /* ---------------------------------------------------------------------
  * net_device_ops
@@ -95,9 +143,9 @@ static int nic_open(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
 	int err;
-    u8 i;
+    u8 i, tmp;
 
-    netdev_dbg(ndev, "nic_open called\n");
+    netdev_info(ndev, "nic_open called\n");
 
 	err = request_irq(priv->irq, nic_irq_handler, IRQF_SHARED,
 			   DRV_NAME, ndev);
@@ -120,10 +168,20 @@ static int nic_open(struct net_device *ndev)
     priv->tx_head = 0;
     priv->tx_tail = 0;
     priv->tx_free = NUM_TX_DESC;
-    netdev_dbg(ndev, "tx alloc done.\n");
+    netdev_info(ndev, "tx alloc done.\n");
     for (i = 0; i < NUM_TX_DESC; i++) {
-        netdev_dbg(ndev, "tx_buf[%d]: %p, tx_buf_dma[%d]: %p\n", i, priv->tx_buf[i], i, (void *)priv->tx_buf_dma[i]);
+        netdev_info(ndev, "tx_buf[%d]: %p, tx_buf_dma[%d]: %p\n", i, priv->tx_buf[i], i, (void *)priv->tx_buf_dma[i]);
     }
+
+	//tx imr
+	tmp = readb(priv->hw_addr + RTL_REG_IMR);
+	tmp |= ( INT_TOK | INT_TER );
+	writeb( tmp, priv->hw_addr + RTL_REG_IMR); /* enable TX interrupts */
+
+	//tx enable
+	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp |= ( CR_TE );
+	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* TX enable*/
 
 
 	napi_enable(&priv->napi);
@@ -143,9 +201,9 @@ err_free_dma:
 static int nic_stop(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
-    u8 i;
+    u8 i, tmp;
 
-    netdev_dbg(ndev, "nic_stop called\n");
+    netdev_info(ndev, "nic_stop called\n");
 
 	netif_stop_queue(ndev);
 	napi_disable(&priv->napi);
@@ -163,7 +221,16 @@ static int nic_stop(struct net_device *ndev)
     priv->tx_head = 0;
     priv->tx_tail = 0;
     priv->tx_free = NUM_TX_DESC;
-    netdev_dbg(ndev, "tx dma_free_coherent done.\n");
+    netdev_info(ndev, "tx dma_free_coherent done.\n");
+
+	// disable TX interrupts
+	tmp = readb(priv->hw_addr + RTL_REG_IMR);
+	tmp &= ~( INT_TOK | INT_TER );
+	writew( tmp, priv->hw_addr + RTL_REG_IMR); /* disable TX interrupts */
+	// tx en
+	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp &= ~( CR_TE );
+	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* TX disable*/
 
 	free_irq(priv->irq, ndev);
 
@@ -218,7 +285,7 @@ static netdev_tx_t nic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
     spin_unlock_irqrestore(&priv->lock, flags);
 
-	dev_kfree_skb(skb);
+	dev_consume_skb_any(skb);
 	priv->ndev->stats.tx_packets++;
 
 	return NETDEV_TX_OK;
