@@ -1,4 +1,6 @@
 /* RTL8139 TX Registers (Offset difference is 4 bytes for each slot) */
+#define RTL_REG_MAC0    0x00
+#define RTL_REG_MAC4    0x04
 #define RTL_REG_TSD0    0x10  /* Transmit Status Descriptor 0~3 (32-bit) */
 #define RTL_REG_TSAD0   0x20  /* Transmit Start Address Descriptor 0~3 (32-bit) */
 #define RTL_REG_COMMAND 0x37  /* Command Register (8-bit) */

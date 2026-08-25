@@ -293,14 +293,46 @@ static netdev_tx_t nic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 static void nic_tx_timeout(struct net_device *ndev, unsigned int txqueue)
 {
+	struct nic_priv *priv = netdev_priv(ndev);
+    unsigned long flags;
+    u8 cmd;
+
 	netdev_warn(ndev, "transmit timed out\n");
 
 	/* TODO: reset TX ring / device state */
+	/* 1. Protect state modification with spinlock */
+    spin_lock_irqsave(&priv->lock, flags);
+
+    /* Update error statistics */
+    ndev->stats.tx_errors++;
+
+    /* 2. Reset RTL8139 hardware transmitter */
+    /* Disable TE (Transmit Enable) temporarily */
+    cmd = readb(priv->hw_addr + RTL_REG_COMMAND);
+    cmd &= ~CR_TE;
+    writeb(cmd, priv->hw_addr + RTL_REG_COMMAND);
+
+    /* Reset TX Software descriptors state */
+    priv->tx_head = 0;
+    priv->tx_tail = 0;
+    priv->tx_free = NUM_TX_DESC;
+
+    /* Re-enable TE (Transmit Enable) on hardware */
+    cmd |= CR_TE;
+    writeb(cmd, priv->hw_addr + RTL_REG_COMMAND);
+
+    /* 3. Update kernel transmit timestamp and wake up the queue */
+    netif_trans_update(ndev);
+    netif_wake_queue(ndev);
+
+    spin_unlock_irqrestore(&priv->lock, flags);
 }
 
 static int nic_set_mac_address(struct net_device *ndev, void *addr)
 {
 	int err;
+	struct nic_priv *priv = netdev_priv(ndev);
+	struct sockaddr *saddr = addr;
 
 	err = eth_mac_addr(ndev, addr);
 	if (err)
@@ -309,6 +341,9 @@ static int nic_set_mac_address(struct net_device *ndev, void *addr)
 	/* TODO: program the new MAC address into the device's
 	 * hardware address filter registers.
 	 */
+	writel(get_unaligned_le32(saddr->sa_data), priv->hw_addr + RTL_REG_MAC0);
+    writew(get_unaligned_le16(saddr->sa_data + 4), priv->hw_addr + RTL_REG_MAC4);
+	netdev_info(ndev, "MAC address set\n");
 
 	return 0;
 }
