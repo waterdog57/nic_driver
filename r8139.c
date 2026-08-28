@@ -18,6 +18,7 @@
 #include <linux/interrupt.h>
 #include <linux/version.h>
 #include <linux/types.h>
+#include <linux/delay.h>
 #include "r8139.h"
 
 #define DRV_NAME	"waterdog_driver"
@@ -27,8 +28,6 @@
 #define MY_VENDOR_ID	0x10ec
 #define MY_DEVICE_ID	0x8139
 
-#define TX_RING_SIZE	64
-#define RX_RING_SIZE	64
 #define NAPI_WEIGHT	    64
 
 struct nic_priv {
@@ -46,6 +45,10 @@ struct nic_priv {
     unsigned int   tx_head;                 /* Head index for next TX descriptor (0~3) */
     unsigned int   tx_tail;                 /* Tail index for next TX cleanup (0~3) */
     unsigned int   tx_free;                 /* Number of remaining available slots */
+	/*  RX Ring Control */
+    u8             *rx_buf;     /* Virtual addresses for DMA buffers */
+    dma_addr_t     rx_buf_dma; /* Physical DMA addresses */
+    unsigned int   rx_offset;                 /* Head index for next RX descriptor (0~63) */
 };
 
 /* ---------------------------------------------------------------------
@@ -54,17 +57,64 @@ struct nic_priv {
 
 static int nic_poll(struct napi_struct *napi, int budget)
 {
-	// struct nic_priv *priv = container_of(napi, struct nic_priv, napi);
+	struct nic_priv *priv = netdev_priv(napi->dev);
+	u16 tmp;
+	u32 rx_status;
+	u16 pkt_len;
+	u8 *rx_ring = priv->rx_buf;
+	struct sk_buff *skb;
 	int work_done = 0;
+	u32 ring_offset;
 
-	/* TODO: walk the RX ring, allocate/handle sk_buffs, call
-	 * napi_gro_receive() or netif_receive_skb() for each packet,
-	 * and increment work_done up to budget.
-	 */
+
+	while(work_done < budget) {
+		if( readb(priv->hw_addr + RTL_REG_COMMAND) & CR_BUFE ) {
+			break;
+		}
+		ring_offset = priv->rx_offset % RX_BUF_LEN;
+
+		rx_status = le16_to_cpu(*(u16 *)(rx_ring + ring_offset));
+        pkt_len   = le16_to_cpu(*(u16 *)(rx_ring + ring_offset + 2));
+
+		if (pkt_len < 4 || pkt_len > MAX_ETH_FRAME_SIZE + 4) {
+			netdev_err(priv->ndev, "invalid rx pkt_len %u, status 0x%x\n",
+				   pkt_len, rx_status);
+			priv->ndev->stats.rx_errors++;
+			break;
+		}
+
+		// crc : 4 bytes
+		pkt_len -= 4;
+
+		if(rx_status & RTL_RX_PACKET_STATUS_ROK) {
+			/* Allocate SKB and copy data */
+			skb = netdev_alloc_skb_ip_align(priv->ndev, pkt_len);
+			if(!skb) {
+				netdev_err(priv->ndev, "Failed to allocate skb\n");
+				priv->ndev->stats.rx_dropped++;
+				break;
+			}
+			memcpy(skb_put(skb, pkt_len), rx_ring + ring_offset + 4, pkt_len);
+			skb->protocol = eth_type_trans(skb, priv->ndev);
+
+			napi_gro_receive(napi, skb);
+			priv->ndev->stats.rx_packets++;
+            priv->ndev->stats.rx_bytes += pkt_len;
+            work_done++;
+		}else{
+			priv->ndev->stats.rx_errors++;
+		}
+		priv->rx_offset = (priv->rx_offset + pkt_len + 4 + 4 + 3) & ~3; /* Align to 4 bytes */
+		writew(priv->rx_offset - 0x10, priv->hw_addr + RTL_REG_CAPR); /* Update CAPR to indicate processed data */
+	}
 
 	if (work_done < budget) {
 		napi_complete_done(napi, work_done);
 		/* TODO: re-enable RX interrupt on the device */
+		tmp = readw(priv->hw_addr + RTL_REG_IMR);
+		tmp |= ( INT_ROK | INT_RER );
+		writew( tmp, priv->hw_addr + RTL_REG_IMR); /* enable RX interrupts */
+		// netdev_info(priv->ndev, "RX interrupt re-enabled\n");
 	}
 
 	return work_done;
@@ -108,6 +158,7 @@ static irqreturn_t nic_irq_handler(int irq, void *dev_id)
 	struct net_device *ndev = dev_id;
 	struct nic_priv *priv = netdev_priv(ndev);
 	u16 status;
+	u8 tmp;
 
 	/* TODO: read/ack interrupt status register; if this IRQ isn't
 	 * ours, return IRQ_NONE.
@@ -122,14 +173,16 @@ static irqreturn_t nic_irq_handler(int irq, void *dev_id)
 
 	if (status & (INT_TOK | INT_TER )) {
 		nic_tx_cleanup(ndev);
-		netdev_info(ndev, "TX interrupt: status=0x%04x\n", status);
 	}
-		
-	if (napi_schedule_prep(&priv->napi)) {
-		/* TODO: mask RX interrupt on the device here */
-		__napi_schedule(&priv->napi);
+	
+	if (status & (INT_ROK | INT_RER )) {
+		if (napi_schedule_prep(&priv->napi)) {
+			tmp = readw(priv->hw_addr + RTL_REG_IMR);
+			tmp &= ~( INT_ROK | INT_RER );
+			writew( tmp, priv->hw_addr + RTL_REG_IMR);
+			__napi_schedule(&priv->napi);
+		}
 	}
-
 	return IRQ_HANDLED;
 }
 
@@ -143,7 +196,7 @@ static int nic_open(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
 	int err;
-    u8 i, tmp;
+    u8 i, tmp, timeout = 100;
 
     netdev_info(ndev, "nic_open called\n");
 
@@ -154,10 +207,18 @@ static int nic_open(struct net_device *ndev)
 		return err;
 	}
 
-	/* TODO: allocate TX/RX descriptor rings + DMA buffers, program
-	 * the device with their addresses, and enable RX/TX on the MAC.
-	 */
-    // tx
+	// soft reset
+	writeb(CR_RST, priv->hw_addr + RTL_REG_COMMAND);
+	while( readb(priv->hw_addr + RTL_REG_COMMAND) & CR_RST ) {
+		udelay(10);
+		timeout--;
+		if (timeout == 0) {
+			netdev_err(ndev, "Timeout waiting for soft reset\n");
+			return -ETIMEDOUT;
+		}
+	}
+
+    // TX
     /* 1. Allocate coherent DMA memory for all 4 TX slots */
     for (i = 0; i < NUM_TX_DESC; i++) {
         priv->tx_buf[i] = dma_alloc_coherent(&priv->pdev->dev, TX_BUF_SIZE,
@@ -173,21 +234,53 @@ static int nic_open(struct net_device *ndev)
         netdev_info(ndev, "tx_buf[%d]: %p, tx_buf_dma[%d]: %p\n", i, priv->tx_buf[i], i, (void *)priv->tx_buf_dma[i]);
     }
 
+	// RX
+	// packet format : 4 byte header(len) + data
+	priv->rx_buf = dma_alloc_coherent(&priv->pdev->dev, RX_BUF_TOT_LEN,
+											&priv->rx_buf_dma, GFP_KERNEL);
+	if (!priv->rx_buf)
+		goto err_free_dma_rx;
+	netdev_info(ndev, "rx alloc done.\n");
+	netdev_info(ndev, "rx_buf: %p, rx_buf_dma: %p\n", priv->rx_buf, (void *)priv->rx_buf_dma);
+	writel(priv->rx_buf_dma, priv->hw_addr + RTL_REG_RBSTART);
+	writel(RTL8139_CAPR_INIT, priv->hw_addr + RTL_REG_CAPR);
+	priv->rx_offset = 0;
+
+	/* 4. Configure RCR (0x44): Accept Broadcast, Multicast, My Address, Physical match + 8K buffer size */
+    writel(0x0000000F | (0 << 11), priv->hw_addr + RTL_REG_RCR);
+
+	//debug 
+	netdev_info(ndev, "RCR: 0x%x\n", readb(priv->hw_addr + RTL_REG_RCR));
+
+
 	//tx imr
-	tmp = readb(priv->hw_addr + RTL_REG_IMR);
+	tmp = readw(priv->hw_addr + RTL_REG_IMR);
 	tmp |= ( INT_TOK | INT_TER );
-	writeb( tmp, priv->hw_addr + RTL_REG_IMR); /* enable TX interrupts */
+	writew( tmp, priv->hw_addr + RTL_REG_IMR); /* enable TX interrupts */
 
 	//tx enable
 	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
 	tmp |= ( CR_TE );
 	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* TX enable*/
 
+	//rx imr
+	tmp = readw(priv->hw_addr + RTL_REG_IMR);
+	tmp |= ( INT_ROK | INT_RER );
+	writew( tmp, priv->hw_addr + RTL_REG_IMR); /* enable RX interrupts */
+
+	//rx enable
+	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp |= ( CR_RE );
+	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* RX enable*/
 
 	napi_enable(&priv->napi);
 	netif_start_queue(ndev);
 
 	return 0;
+
+err_free_dma_rx:
+	dma_free_coherent(&priv->pdev->dev, RX_BUF_TOT_LEN,
+					  priv->rx_buf, priv->rx_buf_dma);
 
 err_free_dma:
     /* Free previously allocated DMA memory on failure */
@@ -211,10 +304,29 @@ static int nic_stop(struct net_device *ndev)
 	/* TODO: disable RX/TX on the device, free descriptor rings and
 	 * DMA buffers.
 	 */
+	// disable TX interrupts
+	tmp = readw(priv->hw_addr + RTL_REG_IMR);
+	tmp &= ~( INT_TOK | INT_TER );
+	writew( tmp, priv->hw_addr + RTL_REG_IMR);
+	// disable RX interrupts
+	tmp = readw(priv->hw_addr + RTL_REG_IMR);
+	tmp &= ~( INT_ROK | INT_RER );
+	writew( tmp, priv->hw_addr + RTL_REG_IMR);
+
+	// tx en
+	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp &= ~( CR_TE );
+	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND);
+	// rx en
+	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp &= ~( CR_RE );
+	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND);
+
+
+
     // tx
     for (i = 0; i < NUM_TX_DESC; i++) {
-        dma_free_coherent(&priv->pdev->dev, TX_BUF_SIZE,
-                            &priv->tx_buf_dma[i], GFP_KERNEL);
+        dma_free_coherent(&priv->pdev->dev, TX_BUF_SIZE, priv->tx_buf[i], priv->tx_buf_dma[i]);
         priv->tx_buf[i] = 0;
         priv->tx_buf_dma[i] = 0;
     }
@@ -223,14 +335,10 @@ static int nic_stop(struct net_device *ndev)
     priv->tx_free = NUM_TX_DESC;
     netdev_info(ndev, "tx dma_free_coherent done.\n");
 
-	// disable TX interrupts
-	tmp = readb(priv->hw_addr + RTL_REG_IMR);
-	tmp &= ~( INT_TOK | INT_TER );
-	writew( tmp, priv->hw_addr + RTL_REG_IMR); /* disable TX interrupts */
-	// tx en
-	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
-	tmp &= ~( CR_TE );
-	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* TX disable*/
+	// rx
+	dma_free_coherent(&priv->pdev->dev, RX_BUF_TOT_LEN, priv->rx_buf, priv->rx_buf_dma);
+	priv->rx_buf = 0;
+    netdev_info(ndev, "rx dma_free_coherent done.\n");
 
 	free_irq(priv->irq, ndev);
 
