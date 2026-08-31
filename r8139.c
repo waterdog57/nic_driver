@@ -19,6 +19,7 @@
 #include <linux/version.h>
 #include <linux/types.h>
 #include <linux/delay.h>
+#include <linux/crc32.h>
 #include "r8139.h"
 
 #define DRV_NAME	"waterdog_driver"
@@ -55,6 +56,25 @@ struct nic_priv {
  * NAPI poll / interrupt handling
  * ------------------------------------------------------------------- */
 
+/* Program RBSTART/CAPR and reset the software read cursor. Used both at
+ * initial bring-up and to recover after the chip hands us a corrupted Rx
+ * header (see the "Bug?" comment in the reference 8139too.c driver). */
+static void nic_rx_ring_init(struct nic_priv *priv)
+{
+	writel(priv->rx_buf_dma, priv->hw_addr + RTL_REG_RBSTART);
+	writel(RTL8139_CAPR_INIT, priv->hw_addr + RTL_REG_CAPR);
+	priv->rx_offset = 0;
+}
+
+static void nic_rx_reset(struct nic_priv *priv)
+{
+	u8 cmd = readb(priv->hw_addr + RTL_REG_COMMAND);
+
+	writeb(cmd & ~CR_RE, priv->hw_addr + RTL_REG_COMMAND);
+	nic_rx_ring_init(priv);
+	writeb(cmd | CR_RE, priv->hw_addr + RTL_REG_COMMAND);
+}
+
 static int nic_poll(struct napi_struct *napi, int budget)
 {
 	struct nic_priv *priv = netdev_priv(napi->dev);
@@ -73,13 +93,18 @@ static int nic_poll(struct napi_struct *napi, int budget)
 		}
 		ring_offset = priv->rx_offset % RX_BUF_LEN;
 
+		rmb(); /* Ensure we read the latest data from the NIC's RX buffer */
 		rx_status = le16_to_cpu(*(u16 *)(rx_ring + ring_offset));
         pkt_len   = le16_to_cpu(*(u16 *)(rx_ring + ring_offset + 2));
 
 		if (pkt_len < 4 || pkt_len > MAX_ETH_FRAME_SIZE + 4) {
-			netdev_err(priv->ndev, "invalid rx pkt_len %u, status 0x%x\n",
+			netdev_err(priv->ndev, "invalid rx pkt_len %u, status 0x%x, resetting rx ring\n",
 				   pkt_len, rx_status);
 			priv->ndev->stats.rx_errors++;
+			/* Chip handed us a corrupted header; rx_offset/CAPR
+			 * would otherwise stay pointed at the bad slot forever.
+			 */
+			nic_rx_reset(priv);
 			break;
 		}
 
@@ -158,7 +183,7 @@ static irqreturn_t nic_irq_handler(int irq, void *dev_id)
 	struct net_device *ndev = dev_id;
 	struct nic_priv *priv = netdev_priv(ndev);
 	u16 status;
-	u8 tmp;
+	u16 tmp;
 
 	/* TODO: read/ack interrupt status register; if this IRQ isn't
 	 * ours, return IRQ_NONE.
@@ -195,8 +220,11 @@ static irqreturn_t nic_irq_handler(int irq, void *dev_id)
 static int nic_open(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
-	int err;
-    u8 i, tmp, timeout = 100;
+	int err, i;
+    u8 timeout = 100;
+	u8 tmp8;
+	u16 tmp16;
+	u32 tmp32;
 
     netdev_info(ndev, "nic_open called\n");
 
@@ -217,6 +245,14 @@ static int nic_open(struct net_device *ndev)
 			return -ETIMEDOUT;
 		}
 	}
+
+	// set mac
+	writeb(CFG9346_UNLOCK, priv->hw_addr + RTL_REG_9346CR); /* Unlock EEPROM access */
+	writel(get_unaligned_le32(ndev->dev_addr), priv->hw_addr + RTL_REG_MAC0);
+    writew(get_unaligned_le16(ndev->dev_addr + 4), priv->hw_addr + RTL_REG_MAC4);
+	writeb(CFG9346_LOCK, priv->hw_addr + RTL_REG_9346CR); /* Lock EEPROM access */
+	netdev_info(ndev, "MAC address set %x\n", readl(priv->hw_addr + RTL_REG_MAC0));
+	netdev_info(ndev, "MAC address set %x\n", readl(priv->hw_addr + RTL_REG_MAC4));
 
     // TX
     /* 1. Allocate coherent DMA memory for all 4 TX slots */
@@ -242,36 +278,38 @@ static int nic_open(struct net_device *ndev)
 		goto err_free_dma_rx;
 	netdev_info(ndev, "rx alloc done.\n");
 	netdev_info(ndev, "rx_buf: %p, rx_buf_dma: %p\n", priv->rx_buf, (void *)priv->rx_buf_dma);
-	writel(priv->rx_buf_dma, priv->hw_addr + RTL_REG_RBSTART);
-	writel(RTL8139_CAPR_INIT, priv->hw_addr + RTL_REG_CAPR);
-	priv->rx_offset = 0;
+	nic_rx_ring_init(priv);
 
 	/* 4. Configure RCR (0x44): Accept Broadcast, Multicast, My Address, Physical match + 8K buffer size */
-    writel(0x0000000F | (0 << 11), priv->hw_addr + RTL_REG_RCR);
+    tmp32 = readl(priv->hw_addr + RTL_REG_RCR);
+	tmp32 |= (RCR_ACCEPT_ALL_PACKETS );
+	writel(tmp32 , priv->hw_addr + RTL_REG_RCR);
 
 	//debug 
-	netdev_info(ndev, "RCR: 0x%x\n", readb(priv->hw_addr + RTL_REG_RCR));
-
+	netdev_info(ndev, "RCR: 0x%x\n", readl(priv->hw_addr + RTL_REG_RCR));
 
 	//tx imr
-	tmp = readw(priv->hw_addr + RTL_REG_IMR);
-	tmp |= ( INT_TOK | INT_TER );
-	writew( tmp, priv->hw_addr + RTL_REG_IMR); /* enable TX interrupts */
+	tmp16 = readw(priv->hw_addr + RTL_REG_IMR);
+	tmp16 |= ( INT_TOK | INT_TER );
+	writew( tmp16, priv->hw_addr + RTL_REG_IMR); /* enable TX interrupts */
 
 	//tx enable
-	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
-	tmp |= ( CR_TE );
-	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* TX enable*/
+	tmp8 = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp8 |= ( CR_TE );
+	writeb( tmp8, priv->hw_addr + RTL_REG_COMMAND); /* TX enable*/
 
 	//rx imr
-	tmp = readw(priv->hw_addr + RTL_REG_IMR);
-	tmp |= ( INT_ROK | INT_RER );
-	writew( tmp, priv->hw_addr + RTL_REG_IMR); /* enable RX interrupts */
+	tmp16 = readw(priv->hw_addr + RTL_REG_IMR);
+	tmp16 |= ( INT_ROK | INT_RER );
+	writew( tmp16, priv->hw_addr + RTL_REG_IMR); /* enable RX interrupts */
 
 	//rx enable
-	tmp = readb(priv->hw_addr + RTL_REG_COMMAND);
-	tmp |= ( CR_RE );
-	writeb( tmp, priv->hw_addr + RTL_REG_COMMAND); /* RX enable*/
+	tmp8 = readb(priv->hw_addr + RTL_REG_COMMAND);
+	tmp8 |= ( CR_RE );
+	writeb( tmp8, priv->hw_addr + RTL_REG_COMMAND); /* RX enable*/
+
+	netdev_info(ndev, "IMR     0x3c : 0x%x\n", readw(priv->hw_addr + RTL_REG_IMR));
+	netdev_info(ndev, "COMMAND 0x37 : 0x%x\n", readb(priv->hw_addr + RTL_REG_COMMAND));
 
 	napi_enable(&priv->napi);
 	netif_start_queue(ndev);
@@ -279,14 +317,13 @@ static int nic_open(struct net_device *ndev)
 	return 0;
 
 err_free_dma_rx:
-	dma_free_coherent(&priv->pdev->dev, RX_BUF_TOT_LEN,
-					  priv->rx_buf, priv->rx_buf_dma);
-
 err_free_dma:
     /* Free previously allocated DMA memory on failure */
     while (--i >= 0) {
-        dma_free_coherent(&priv->pdev->dev, TX_BUF_SIZE,
-                          priv->tx_buf[i], priv->tx_buf_dma[i]);
+		if( priv->tx_buf[i] ){
+			dma_free_coherent(&priv->pdev->dev, TX_BUF_SIZE,
+							priv->tx_buf[i], priv->tx_buf_dma[i]);
+		}
     }
     return -ENOMEM;
 }
@@ -294,7 +331,8 @@ err_free_dma:
 static int nic_stop(struct net_device *ndev)
 {
 	struct nic_priv *priv = netdev_priv(ndev);
-    u8 i, tmp;
+	int i;
+    u8 tmp;
 
     netdev_info(ndev, "nic_stop called\n");
 
@@ -395,6 +433,7 @@ static netdev_tx_t nic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	dev_consume_skb_any(skb);
 	priv->ndev->stats.tx_packets++;
+	priv->ndev->stats.tx_bytes += tsd;
 
 	return NETDEV_TX_OK;
 }
@@ -436,6 +475,69 @@ static void nic_tx_timeout(struct net_device *ndev, unsigned int txqueue)
     spin_unlock_irqrestore(&priv->lock, flags);
 }
 
+/* Multicast hash filter address count above which we give up on the
+ * 64-bit hash table and just accept all multicast frames instead. */
+#define NIC_MC_FILTER_LIMIT	32
+
+static void nic_set_rx_mode(struct net_device *dev)
+{
+	struct nic_priv *priv = netdev_priv(dev);
+	u32 rcr;
+	u32 mc_filter[2];
+	int bit;
+	unsigned long flags;
+	u8 tmp8;
+
+	netdev_info(dev, "%s: dev->flags = 0x%x\n", __func__, dev->flags);
+
+	/* Preserve MXDMA/RBLEN/RXFTH/etc, only touch the accept-mode bits. */
+	rcr = readl(priv->hw_addr + RTL_REG_RCR);
+	rcr &= ~(RCR_ACCEPT_ALL_PACKETS | RCR_ACCEPT_MAC_MATCH_PACKETS |
+		 RCR_ACCEPT_MULTICAST_PACKETS | RCR_ACCEPT_BROADCAST_PACKETS);
+
+	rcr |= RCR_ACCEPT_MAC_MATCH_PACKETS | RCR_ACCEPT_BROADCAST_PACKETS;
+
+	if (dev->flags & IFF_PROMISC) {
+		netdev_info(dev, "Setting IFF_PROMISC mode\n");
+		rcr |= RCR_ACCEPT_ALL_PACKETS | RCR_ACCEPT_MULTICAST_PACKETS;
+		mc_filter[0] = mc_filter[1] = 0xFFFFFFFF;
+	} else if ((dev->flags & IFF_ALLMULTI) ||
+		   netdev_mc_count(dev) > NIC_MC_FILTER_LIMIT) {
+		netdev_info(dev, "Setting IFF_ALLMULTI mode\n");
+		rcr |= RCR_ACCEPT_MULTICAST_PACKETS;
+		mc_filter[0] = mc_filter[1] = 0xFFFFFFFF;
+	} else if (netdev_mc_empty(dev)) {
+		mc_filter[0] = mc_filter[1] = 0;
+	} else {
+		struct netdev_hw_addr *ha;
+
+		rcr |= RCR_ACCEPT_MULTICAST_PACKETS;
+		mc_filter[0] = mc_filter[1] = 0;
+		netdev_for_each_mc_addr(ha, dev) {
+		bit = ether_crc(ETH_ALEN, ha->addr) >> 26;
+
+			mc_filter[bit >> 5] |= 1 << (bit & 31);
+		}
+	}
+
+	spin_lock_irqsave(&priv->lock, flags);
+
+	tmp8 = readb(priv->hw_addr + RTL_REG_COMMAND);
+	writeb(tmp8 & ~CR_RE, priv->hw_addr + RTL_REG_COMMAND);
+
+	writel(mc_filter[0], priv->hw_addr + RTL_REG_MAR0);
+	writel(mc_filter[1], priv->hw_addr + RTL_REG_MAR4);
+
+	writel(rcr, priv->hw_addr + RTL_REG_RCR);
+
+	nic_rx_ring_init(priv);
+	tmp8 = readb(priv->hw_addr + RTL_REG_COMMAND);
+	writeb(tmp8 | CR_RE, priv->hw_addr + RTL_REG_COMMAND);
+	spin_unlock_irqrestore(&priv->lock, flags);
+
+	netdev_info(dev, "RCR 0x%x\n", rcr);
+}
+
 static int nic_set_mac_address(struct net_device *ndev, void *addr)
 {
 	int err;
@@ -446,12 +548,18 @@ static int nic_set_mac_address(struct net_device *ndev, void *addr)
 	if (err)
 		return err;
 
+	writeb(CFG9346_UNLOCK, priv->hw_addr + RTL_REG_9346CR); /* Unlock EEPROM access */
+
 	/* TODO: program the new MAC address into the device's
 	 * hardware address filter registers.
 	 */
 	writel(get_unaligned_le32(saddr->sa_data), priv->hw_addr + RTL_REG_MAC0);
     writew(get_unaligned_le16(saddr->sa_data + 4), priv->hw_addr + RTL_REG_MAC4);
-	netdev_info(ndev, "MAC address set\n");
+
+	netdev_info(ndev, "MAC address set %x\n", readl(priv->hw_addr + RTL_REG_MAC0));
+	netdev_info(ndev, "MAC address set %x\n", readl(priv->hw_addr + RTL_REG_MAC4));
+
+	writeb(CFG9346_LOCK, priv->hw_addr + RTL_REG_9346CR); /* Lock EEPROM access */
 
 	return 0;
 }
@@ -460,6 +568,7 @@ static const struct net_device_ops nic_netdev_ops = {
 	.ndo_open		= nic_open,
 	.ndo_stop		= nic_stop,
 	.ndo_start_xmit		= nic_start_xmit,
+	.ndo_set_rx_mode    = nic_set_rx_mode,
 	.ndo_tx_timeout		= nic_tx_timeout,
 	.ndo_set_mac_address	= nic_set_mac_address,
 	.ndo_validate_addr	= eth_validate_addr,
